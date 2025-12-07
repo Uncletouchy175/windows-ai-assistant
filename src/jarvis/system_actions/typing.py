@@ -7,7 +7,6 @@ dry-run semantics and safety checks.
 
 import logging
 import os
-from typing import Optional
 
 try:
     # Prevent mouseinfo from failing in headless environments

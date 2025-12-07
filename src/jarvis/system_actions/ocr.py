@@ -7,8 +7,6 @@ dry-run semantics and safety checks.
 
 import logging
 import os
-import tempfile
-from pathlib import Path
 from typing import Optional, Tuple
 
 try:
@@ -31,8 +29,8 @@ except ImportError:
     PYTESSERACT_AVAILABLE = False
 
 try:
-    import ctypes
-    from ctypes import wintypes
+    import ctypes  # noqa: F401
+    from ctypes import wintypes  # noqa: F401
 
     WINDOWS_OCR_AVAILABLE = True
 except ImportError:
