@@ -69,7 +69,7 @@ class ResponseGenerator:
         try:
             response = self.llm_client.generate(prompt)
             logger.debug(f"Generated casual response: {response}")
-            return response.strip()
+            return str(response).strip()  # type: ignore[no-any-return]
         except Exception as e:
             logger.warning(f"Failed to generate LLM response: {e}")
             return self._get_simple_casual_response(user_input)
@@ -102,8 +102,7 @@ class ResponseGenerator:
 
         # What's your name
         if any(
-            word in input_lower
-            for word in ["what's your name", "what is your name", "who are you"]
+            word in input_lower for word in ["what's your name", "what is your name", "who are you"]
         ):
             return (
                 "I'm Jarvis, your AI assistant! I can help you with "
@@ -125,11 +124,17 @@ class ResponseGenerator:
 
         # Tell me a joke
         if "joke" in input_lower:
-            return "Why do programmers prefer dark mode? Because light attracts bugs! 😄 But seriously, how can I help you today?"
+            return (
+                "Why do programmers prefer dark mode? Because light "
+                "attracts bugs! 😄 But seriously, how can I help you today?"
+            )
 
         # Thank you
         if any(word in input_lower for word in ["thank", "thanks"]):
-            return "You're welcome! I'm always happy to help. Is there anything else you'd like me to do?"
+            return (
+                "You're welcome! I'm always happy to help. "
+                "Is there anything else you'd like me to do?"
+            )
 
         # Default friendly response
         return "Hello! I'm here to help. What would you like me to do for you?"
