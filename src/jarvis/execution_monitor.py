@@ -93,20 +93,18 @@ class ExecutionMonitor:
 
             # Yield stdout line by line
             if process.stdout:
-                for line in process.stdout.splitlines():
-                    is_error = (
-                        "error" in line.lower()
-                        or "exception" in line.lower()
-                        or "traceback" in line.lower()
-                    )
-                    logger.debug(f"stdout: {line}")
-                    yield (line, "stdout", is_error)
+                for line in process.stdout.split("\n"):
+                    if line.strip():
+                        is_error = self._is_error_line(line)
+                        logger.debug(f"stdout: {line}")
+                        yield (line, "stdout", is_error)
 
             # Yield stderr line by line if captured
             if capture_stderr and process.stderr:
-                for line in process.stderr.splitlines():
-                    logger.debug(f"stderr: {line}")
-                    yield (line, "stderr", True)  # stderr is always error
+                for line in process.stderr.split("\n"):
+                    if line.strip():
+                        logger.debug(f"stderr: {line}")
+                        yield (line, "stderr", True)  # stderr is always error
 
             # If process exited with error code, report it
             if process.returncode != 0:
