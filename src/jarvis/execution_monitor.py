@@ -6,11 +6,15 @@ step output against expected patterns.
 """
 
 import logging
+import queue
 import re
 import subprocess
+import sys
+import threading
+import time
 from typing import Generator, List, Optional, Tuple
 
-from jarvis.execution_models import CodeStep, ExecutionResult
+from jarvis.execution_models import CodeStep
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +62,9 @@ class ExecutionMonitor:
         capture_stderr: bool = True,
     ) -> Generator[Tuple[str, str, bool], None, None]:
         """
-        Execute subprocess and yield output lines in real-time.
+        Execute subprocess and yield (output_line, source, is_error) tuples in real-time.
+
+        Windows-compatible implementation using proper pipe handling with threading.
 
         Args:
             command: Command to execute (as list of strings)
@@ -74,76 +80,119 @@ class ExecutionMonitor:
         logger.info(f"Streaming subprocess output for: {' '.join(command)}")
 
         try:
+            # Windows-specific subprocess creation
+            # Use CREATE_NEW_PROCESS_GROUP on Windows to avoid socket issues
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE if capture_stderr else None,
+                stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                bufsize=1,  # Line buffering
                 universal_newlines=True,
+                creationflags=creation_flags,
             )
 
-            stdout_lines: List[str] = []
-            stderr_lines: List[str] = []
-            exit_code = 0
+            # Use threading for non-blocking reads on Windows
+            stdout_queue = queue.Queue()  # type: ignore[var-annotated]
+            stderr_queue = queue.Queue()  # type: ignore[var-annotated]
+            error_event = threading.Event()
 
-            import select
-
-            while True:
-                # Check if process has finished
-                if process.poll() is not None:
-                    # Read any remaining output
-                    if process.stdout:
-                        for line in process.stdout:
-                            stdout_lines.append(line)
-                            is_error = self._is_error_line(line)
-                            yield (line, "stdout", is_error)
-                    if capture_stderr and process.stderr:
-                        for line in process.stderr:
-                            stderr_lines.append(line)
-                            yield (line, "stderr", True)
-                    break
-
-                # Check for available output
-                streams_to_check = []
-                if process.stdout:
-                    streams_to_check.append(process.stdout)
-                if capture_stderr and process.stderr:
-                    streams_to_check.append(process.stderr)
-
-                if streams_to_check:
-                    readable, _, _ = select.select(streams_to_check, [], [], 0.1)
-
-                    for stream in readable:
-                        line = stream.readline()
+            def read_output(pipe, queue_obj, source):
+                """Read from pipe and put lines into queue."""
+                try:
+                    for line in iter(pipe.readline, ""):
                         if line:
-                            if stream == process.stdout:
-                                stdout_lines.append(line)
-                                logger.debug(f"STDOUT: {line.rstrip()}")
-                                is_error = self._is_error_line(line)
-                                yield (line, "stdout", is_error)
-                            else:
-                                stderr_lines.append(line)
-                                logger.debug(f"STDERR: {line.rstrip()}")
-                                yield (line, "stderr", True)
+                            queue_obj.put((line.rstrip(), source))
+                        if error_event.is_set():
+                            break
+                except Exception as e:
+                    logger.error(f"Error reading {source}: {e}")
+                finally:
+                    queue_obj.put(None)  # Signal end of stream
 
-            exit_code = process.returncode
-            logger.info(f"Process exited with code {exit_code}")
+            # Start reader threads
+            stdout_thread = threading.Thread(
+                target=read_output, args=(process.stdout, stdout_queue, "stdout"), daemon=True
+            )
+            stderr_thread = (
+                threading.Thread(
+                    target=read_output, args=(process.stderr, stderr_queue, "stderr"), daemon=True
+                )
+                if capture_stderr
+                else None
+            )
 
-            if exit_code != 0:
-                logger.warning(f"Process failed with exit code {exit_code}")
+            stdout_thread.start()
+            if stderr_thread:
+                stderr_thread.start()
 
-        except subprocess.TimeoutExpired:
-            logger.error(f"Process timed out after {timeout} seconds")
-            process.kill()
-            yield (f"Timeout after {timeout} seconds\n", "stderr", True)
+            # Yield output as it arrives
+            stdout_done = False
+            stderr_done = False
+
+            start_time = time.time()
+            while not (stdout_done and (stderr_done or not capture_stderr)):
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    logger.warning(f"Subprocess execution timeout after {timeout}s")
+                    error_event.set()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    yield ("", "error", True)
+                    return
+
+                # Try to get output from queues (non-blocking)
+                try:
+                    if not stdout_done:
+                        item = stdout_queue.get_nowait()
+                        if item is None:
+                            stdout_done = True
+                        else:
+                            output, source = item
+                            is_error = (
+                                "error" in output.lower()
+                                or "exception" in output.lower()
+                                or "traceback" in output.lower()
+                            )
+                            logger.debug(f"{source}: {output}")
+                            yield (output, source, is_error)
+                except queue.Empty:
+                    pass
+
+                try:
+                    if capture_stderr and not stderr_done:
+                        item = stderr_queue.get_nowait()
+                        if item is None:
+                            stderr_done = True
+                        else:
+                            output, source = item
+                            logger.debug(f"{source}: {output}")
+                            yield (output, source, True)  # stderr is always error
+                except queue.Empty:
+                    pass
+
+                time.sleep(0.01)  # Small sleep to prevent busy waiting
+
+            # Wait for process to complete
+            process.wait()
+
+            # If process exited with error code, report it
+            if process.returncode != 0:
+                yield (f"Process exited with code {process.returncode}", "error", True)
+
         except Exception as e:
-            logger.error(f"Failed to stream subprocess output: {e}")
-            yield (f"Error: {str(e)}\n", "stderr", True)
+            logger.error(f"Error executing subprocess: {e}", exc_info=True)
+            yield (f"Execution error: {str(e)}", "error", True)
 
-    def validate_step_output(
-        self, output: str, step: CodeStep
-    ) -> Tuple[bool, Optional[str]]:
+    def validate_step_output(self, output: str, step: CodeStep) -> Tuple[bool, Optional[str]]:
         """
         Validate step output against expected patterns.
 
@@ -166,7 +215,9 @@ class ExecutionMonitor:
                 logger.debug(f"Step {step.step_number} output matches pattern")
                 return True, None
             else:
-                error_msg = f"Output does not match expected pattern: {step.expected_output_pattern}"
+                error_msg = (
+                    f"Output does not match expected pattern: {step.expected_output_pattern}"
+                )
                 logger.warning(f"Step {step.step_number} validation failed: {error_msg}")
                 return False, error_msg
         except re.error as e:
@@ -176,6 +227,7 @@ class ExecutionMonitor:
     def parse_error_from_output(self, output: str) -> Tuple[str, str]:
         """
         Parse failure reason from combined stdout/stderr.
+        Windows-compatible error parsing.
 
         Args:
             output: Combined output from execution
@@ -185,38 +237,45 @@ class ExecutionMonitor:
         """
         logger.debug("Parsing error from output")
 
-        # Try to extract error type and details
-        lines = output.split("\n")
+        output_lower = output.lower()
 
-        error_type = "UnknownError"
-        error_details = output[:500]  # First 500 chars as fallback
+        # Windows-specific error patterns
+        if "winerror" in output_lower or "error:" in output_lower:
+            # Extract WinError details
+            winerror_match = re.search(r"\[WinError (\d+)\] (.*?)(?:\n|$)", output)
+            if winerror_match:
+                error_code = winerror_match.group(1)
+                error_msg = winerror_match.group(2)
+                return ("WinError", f"Error {error_code}: {error_msg}")
 
-        # Look for common error patterns
-        for line in lines:
-            # Look for exception type
-            for keyword in self.ERROR_KEYWORDS:
-                if keyword in line:
-                    # Try to extract just the error type
-                    match = re.search(rf"(\w*{keyword}\w*)", line)
-                    if match:
-                        error_type = match.group(1)
-                        logger.debug(f"Detected error type: {error_type}")
-                        break
-            else:
-                continue
-            break
+        # Common Python errors
+        if "importerror" in output_lower:
+            return ("ImportError", output.split("\n")[-2] if "\n" in output else output)
+        if "syntaxerror" in output_lower:
+            return ("SyntaxError", output.split("\n")[-2] if "\n" in output else output)
+        if "typeerror" in output_lower:
+            return ("TypeError", output.split("\n")[-2] if "\n" in output else output)
+        if "attributeerror" in output_lower:
+            return ("AttributeError", output.split("\n")[-2] if "\n" in output else output)
+        if "permissionerror" in output_lower:
+            return ("PermissionError", output.split("\n")[-2] if "\n" in output else output)
+        if "timeout" in output_lower or "timed out" in output_lower:
+            return ("TimeoutError", "Operation timed out")
+        if "connectionerror" in output_lower or "connection" in output_lower:
+            return ("ConnectionError", output.split("\n")[-2] if "\n" in output else output)
 
-        # Try to extract more detailed error message
-        for i, line in enumerate(lines):
-            if any(keyword in line for keyword in self.ERROR_KEYWORDS):
-                # Get context around the error
-                start = max(0, i - 1)
-                end = min(len(lines), i + 3)
-                error_details = "\n".join(lines[start:end])
-                logger.debug(f"Extracted error details: {error_details[:200]}...")
-                break
+        # Generic error keywords
+        if "traceback" in output_lower:
+            lines = output.split("\n")
+            return ("RuntimeError", lines[-2] if len(lines) > 1 else output)
+        if "exception" in output_lower:
+            lines = output.split("\n")
+            return ("Exception", lines[-2] if len(lines) > 1 else output)
+        if "failed" in output_lower:
+            lines = output.split("\n")
+            return ("ExecutionError", lines[-2] if len(lines) > 1 else output)
 
-        return error_type, error_details
+        return ("Error", output[:200])  # First 200 chars as fallback
 
     def _is_error_line(self, line: str) -> bool:
         """
@@ -254,18 +313,16 @@ class ExecutionMonitor:
 
         if step.code:
             # Execute code (write to temp file and run)
-            import tempfile
             import os
+            import tempfile
 
             # Write code to temp file
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", delete=False
-            ) as f:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
                 f.write(step.code)
                 temp_file = f.name
 
             try:
-                command = ["python", temp_file]
+                command = [sys.executable, temp_file]
                 for line, source, is_error in self.stream_subprocess_output(
                     command, timeout=timeout
                 ):

@@ -8,7 +8,7 @@ re-running successful ones.
 import logging
 from typing import Optional, Tuple
 
-from jarvis.execution_models import CodeStep, FailureDiagnosis, ExecutionResult
+from jarvis.execution_models import CodeStep, FailureDiagnosis
 from jarvis.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,21 @@ class AdaptiveFixEngine:
             # Parse response into FailureDiagnosis
             diagnosis = self._parse_diagnosis_response(response, error_type, error_details)
             logger.info(f"Diagnosis complete: {diagnosis.root_cause}")
+
+            # Override incorrect diagnoses for Windows socket errors
+            if (
+                "winerror" in error_details.lower() or "socket" in error_details.lower()
+            ) and "posix" in diagnosis.root_cause.lower():
+                logger.warning("Overriding incorrect POSIX diagnosis for Windows socket error")
+                return FailureDiagnosis(
+                    error_type=error_type,
+                    error_details=error_details,
+                    root_cause="Windows subprocess pipe handling issue",
+                    suggested_fix="Ensure subprocess pipes are properly created and handled",
+                    fix_strategy="manual",
+                    confidence=0.9,
+                )
+
             return diagnosis
         except Exception as e:
             logger.error(f"Failed to diagnose failure: {e}")
@@ -79,9 +94,7 @@ class AdaptiveFixEngine:
                 confidence=0.3,
             )
 
-    def generate_fix(
-        self, step: CodeStep, diagnosis: FailureDiagnosis, retry_count: int
-    ) -> str:
+    def generate_fix(self, step: CodeStep, diagnosis: FailureDiagnosis, retry_count: int) -> str:
         """
         Generate fixed code based on diagnosis.
 
@@ -100,7 +113,7 @@ class AdaptiveFixEngine:
         try:
             fixed_code = self.llm_client.generate(prompt)
             logger.debug(f"Generated fix length: {len(fixed_code)} characters")
-            return fixed_code
+            return str(fixed_code)
         except Exception as e:
             logger.error(f"Failed to generate fix: {e}")
             raise
@@ -121,21 +134,20 @@ class AdaptiveFixEngine:
         """
         logger.info(f"Retrying step {step.step_number} with fix")
 
-        import subprocess
-        import tempfile
         import os
+        import subprocess
+        import sys
+        import tempfile
 
         # Write fixed code to temp file
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(fixed_code)
             temp_file = f.name
 
         try:
-            # Execute fixed code
+            # Execute fixed code using the current Python interpreter
             result = subprocess.run(
-                ["python", temp_file],
+                [sys.executable, temp_file],
                 capture_output=True,
                 text=True,
                 timeout=step.timeout_seconds,
@@ -173,7 +185,57 @@ class AdaptiveFixEngine:
         original_output: str,
     ) -> str:
         """Build prompt for failure diagnosis."""
-        prompt = f"""Analyze this code execution failure and provide a detailed diagnosis.
+        # Check for Windows socket errors
+        is_windows_socket_error = (
+            "winerror" in error_details.lower()
+            or "socket" in error_details.lower()
+            or "wsaenotsock" in error_details.lower()
+        )
+
+        if is_windows_socket_error:
+            prompt = f"""A subprocess execution failed on Windows with this error:
+
+Step Description: {step.description}
+
+Original Code:
+```python
+{step.code or "No code provided"}
+```
+
+Error Type: {error_type}
+
+Error Details:
+{error_details}
+
+Full Output:
+{original_output[:1000]}
+
+This is likely a Windows subprocess/pipe issue, NOT a POSIX compatibility issue.
+
+Suggest a fix that:
+1. Adds proper error handling for this specific error
+2. Works specifically on Windows
+3. Does NOT try to make the code POSIX-compatible (that's not the issue)
+
+Provide your diagnosis in this JSON format:
+{{
+  "root_cause": "Clear explanation of what went wrong",
+  "suggested_fix": "Specific fix to apply",
+  "fix_strategy": "one of: regenerate_code, add_retry_logic, "
+                 "install_package, adjust_parameters, or manual",
+  "confidence": 0.0 to 1.0
+}}
+
+Common fix strategies:
+- regenerate_code: Rewrite the code to fix bugs
+- add_retry_logic: Add retry logic with backoff
+- install_package: Install missing dependencies
+- adjust_parameters: Change parameters or configuration
+- manual: Requires human intervention
+
+Return only valid JSON, no other text."""
+        else:
+            prompt = f"""Analyze this code execution failure and provide a detailed diagnosis.
 
 Step Description: {step.description}
 
@@ -194,7 +256,8 @@ Provide your diagnosis in this JSON format:
 {{
   "root_cause": "Clear explanation of what went wrong",
   "suggested_fix": "Specific fix to apply",
-  "fix_strategy": "one of: regenerate_code, add_retry_logic, install_package, adjust_parameters, or manual",
+  "fix_strategy": "one of: regenerate_code, add_retry_logic, "
+                 "install_package, adjust_parameters, or manual",
   "confidence": 0.0 to 1.0
 }}
 
@@ -244,7 +307,6 @@ Return only the fixed code, no other text."""
     ) -> FailureDiagnosis:
         """Parse LLM response into FailureDiagnosis."""
         import json
-        import re
 
         try:
             # Try to extract JSON from response

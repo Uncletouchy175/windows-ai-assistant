@@ -6,11 +6,11 @@ Handles DIRECT mode requests: generate code, write to file, execute immediately.
 
 import logging
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Generator, Optional
 
-from jarvis.execution_models import CodeStep, ExecutionResult
 from jarvis.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class DirectExecutor:
         try:
             code = self.llm_client.generate(prompt)
             logger.debug(f"Generated code length: {len(code)} characters")
-            return code
+            return str(code)
         except Exception as e:
             logger.error(f"Failed to generate code: {e}")
             raise
@@ -79,6 +79,7 @@ class DirectExecutor:
         if filename is None:
             # Auto-generate filename with timestamp
             import time
+
             timestamp = int(time.time())
             filename = f"jarvis_script_{timestamp}.py"
 
@@ -100,11 +101,11 @@ class DirectExecutor:
             logger.error(f"Failed to write script: {e}")
             raise
 
-    def stream_execution(
-        self, script_path: Path, timeout: int = 30
-    ) -> Generator[str, None, None]:
+    def stream_execution(self, script_path: Path, timeout: int = 30) -> Generator[str, None, None]:
         """
         Execute script and stream output in real-time.
+
+        Windows-compatible implementation using threading for non-blocking reads.
 
         Args:
             script_path: Path to the script to execute
@@ -116,52 +117,106 @@ class DirectExecutor:
         logger.info(f"Streaming execution of {script_path}")
 
         try:
-            # Use subprocess with unbuffered output
+            # Windows-specific subprocess creation
+            import queue
+            import threading
+            import time
+
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
             process = subprocess.Popen(
-                ["python", str(script_path)],
+                [sys.executable, str(script_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
                 text=True,
-                bufsize=1,  # Line buffered
+                bufsize=1,
                 universal_newlines=True,
+                creationflags=creation_flags,
             )
 
-            # Stream output in real-time
-            import select
+            # Use threading for non-blocking reads
+            stdout_queue = queue.Queue()  # type: ignore[var-annotated]
+            stderr_queue = queue.Queue()  # type: ignore[var-annotated]
+            error_event = threading.Event()
+
+            def read_output(pipe, queue_obj):
+                """Read from pipe and put lines into queue."""
+                try:
+                    for line in iter(pipe.readline, ""):
+                        if line:
+                            queue_obj.put(line)
+                        if error_event.is_set():
+                            break
+                except Exception as e:
+                    logger.error(f"Error reading from pipe: {e}")
+                finally:
+                    queue_obj.put(None)  # Signal end of stream
+
+            # Start reader threads
+            stdout_thread = threading.Thread(
+                target=read_output, args=(process.stdout, stdout_queue), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=read_output, args=(process.stderr, stderr_queue), daemon=True
+            )
+
+            stdout_thread.start()
+            stderr_thread.start()
 
             stdout_lines = []
             stderr_lines = []
+            stdout_done = False
+            stderr_done = False
 
-            while True:
-                # Check if process has finished
-                if process.poll() is not None:
-                    # Read any remaining output
-                    if process.stdout:
-                        for line in process.stdout:
-                            stdout_lines.append(line)
-                            yield line
-                    if process.stderr:
-                        for line in process.stderr:
-                            stderr_lines.append(line)
-                            yield line
-                    break
+            start_time = time.time()
+            while not (stdout_done and stderr_done):
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    logger.warning(f"Script execution timeout after {timeout}s")
+                    error_event.set()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    yield f"\n❌ Error: Execution timed out after {timeout} seconds"
+                    return
 
-                # Check for available output
-                readable, _, _ = select.select(
-                    [process.stdout, process.stderr], [], [], 0.1
-                )
-
-                for stream in readable:
-                    line = stream.readline()
-                    if line:
-                        if stream == process.stdout:
+                # Try to get output from stdout queue (non-blocking)
+                try:
+                    if not stdout_done:
+                        item = stdout_queue.get_nowait()
+                        if item is None:
+                            stdout_done = True
+                        else:
+                            line = item
                             stdout_lines.append(line)
                             logger.debug(f"STDOUT: {line.rstrip()}")
+                            yield line
+                except queue.Empty:
+                    pass
+
+                # Try to get output from stderr queue (non-blocking)
+                try:
+                    if not stderr_done:
+                        item = stderr_queue.get_nowait()
+                        if item is None:
+                            stderr_done = True
                         else:
+                            line = item
                             stderr_lines.append(line)
                             logger.debug(f"STDERR: {line.rstrip()}")
-                        yield line
+                            yield line
+                except queue.Empty:
+                    pass
 
+                time.sleep(0.01)  # Small sleep to prevent busy waiting
+
+            # Wait for process to complete
+            process.wait()
             exit_code = process.returncode
             logger.info(f"Process exited with code {exit_code}")
 
@@ -169,10 +224,6 @@ class DirectExecutor:
                 stderr_output = "".join(stderr_lines)
                 logger.warning(f"Script failed with exit code {exit_code}: {stderr_output}")
 
-        except subprocess.TimeoutExpired:
-            logger.error(f"Script execution timed out after {timeout} seconds")
-            process.kill()
-            yield f"\n❌ Error: Execution timed out after {timeout} seconds"
         except Exception as e:
             logger.error(f"Failed to stream execution: {e}")
             yield f"\n❌ Error: {str(e)}"
@@ -217,9 +268,7 @@ class DirectExecutor:
             logger.error(f"Failed to execute request: {e}")
             yield f"\n❌ Error: {str(e)}\n"
 
-    def _build_code_generation_prompt(
-        self, user_request: str, language: str
-    ) -> str:
+    def _build_code_generation_prompt(self, user_request: str, language: str) -> str:
         """
         Build prompt for code generation.
 
